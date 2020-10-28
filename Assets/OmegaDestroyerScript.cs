@@ -1,0 +1,834 @@
+﻿using Debug = UnityEngine.Debug;
+using KModkit;
+using Rnd = UnityEngine.Random;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text.RegularExpressions;
+using UnityEngine;
+
+public class OmegaDestroyerScript : MonoBehaviour {
+	private const string VERSION = "1.0.0";
+	private const float TIME_DELAY = 2f;
+	private const float LIGHTS_DELAY = 6f;
+
+	public KMAudio Audio;
+	public KMBombModule Module;
+	public KMBossModule Boss;
+	public KMBombInfo Bomb;
+	public TextMesh[] Numbers;
+	public Renderer[] ColorChanger;
+	public KMSelectable[] Buttons;
+	public Material[] Lights;
+	public Material[] BColors;
+	public Renderer[] BCChanger;
+	public Light[] Lightarray;
+	static private int _moduleIdCounter = 1;
+	private int _moduleId;
+
+	private const byte NUMBERED_BUTTONS = 10; //Amount of numbered buttons, buttons after numbered are main displays
+	private const byte NON_MAIN_NUMBERS = 2; //Amount of changable numbers before main display numbers
+	private const int INITIAL_TIME = 360;
+	private const byte RESETS_BEFORE_FULL = 8; //Note: KYBER Reset = 180 t-steps, aka 360 seconds
+	private const int FULL_RESET_TIME = INITIAL_TIME + 180 * RESETS_BEFORE_FULL;
+
+	private readonly long[] MWYTH_NUMBERS = {55363537, 55363573, 55365337, 55365373, 55633537, 55633573, 55635337, 55635373};
+	private readonly byte[] PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}; //sqrt(max possible k) < 41
+	private List<int>[] ROTORS; //Re-initialized every strike or reset to undo possible turning
+
+	private Stopwatch tlHoldTime;
+	private sbyte nextButton; //987654321043210 repeating
+	private enum BRActionSet {CLEAR, FULL_RESET, HARD_MODE_START};
+	private BRActionSet BRAction; //What BR does when pressed (see above for options)
+	private bool locked, solved, split, muted, justReset, showingPAINs, mwythDeactivatable, mwyth, shouldStop, BRBigAction;
+
+	//A bunch of calculation-related things
+	private long alpha, beta, omega, k, t, Rv;
+	private bool[] swaps; //TL, TR, BL, BR
+	private long[] PAINs; //P1-P4
+	private string input;
+
+	void Awake() {
+		_moduleId = _moduleIdCounter++;
+
+		for(byte i = 0; i < Buttons.Length; i++) {
+			KMSelectable btn = Buttons[i];
+			btn.OnInteract += delegate {
+				HandlePress(btn);
+				return false;
+			};
+		} //Special delegation for TL release
+		Buttons[10].OnInteractEnded += delegate {
+			if(tlHoldTime.IsRunning) {
+				tlHoldTime.Stop();
+				StartCoroutine(TLUp());
+			}
+		};
+	}
+
+	//Use this for initialization
+	void Start() {
+		locked = true; //Lock all buttons while lights off
+		//Log start message, then set most flags and initial values/references
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Version {1} of OmegaDestroyer started. Good luck!", _moduleId, VERSION);
+		solved = muted = mwythDeactivatable = mwyth = shouldStop = BRBigAction = false;
+		BRAction = BRActionSet.CLEAR; //Initially, BR just clears input
+		tlHoldTime = new Stopwatch();
+		swaps = new bool[4];
+		PAINs = new long[4];
+		nextButton = 9; //Input and rotors set in FullReset()
+		for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+			BCChanger[i].material = BColors[5];
+		StartCoroutine(StartButWithYieldReturnNewWaitforseconds());
+	}
+
+	void HandlePress(KMSelectable btn) {
+		int pressed = Array.IndexOf(Buttons, btn);
+		Buttons[pressed].AddInteractionPunch();
+		if((!muted || solved) && !Application.isEditor) //Only play sounds if unmuted (or solved)
+			Audio.PlaySoundAtTransform("PressBeep", Numbers[0].transform);
+		if(mwythDeactivatable && pressed == 10 && !solved)
+			MWYTHOff();
+		if(solved && mwyth)
+			Special(pressed);
+		if(solved || locked)
+			return;
+
+		switch(pressed) {
+			case 10: { //TL
+				if(mwyth) { //Hard mode: toggle PAINs
+					showingPAINs = !showingPAINs;
+					UpdateDisplays();
+				} else { //Otherwise: start stopwatch
+					tlHoldTime.Reset();
+					tlHoldTime.Start();
+				}
+				break;
+			}
+			case 11: { //TR
+				Submit();
+				break;
+			}
+			case 12: { //BL
+				split = !split;
+				if(split) //Timer blue if split
+					Numbers[1].color = Color.blue;
+				else { //Timer black if unsplit
+					Numbers[1].color = Color.black;
+					UpdateDisplays();
+				} //Also update displays on unsplitting
+				break;
+			}
+			case 13: { //BR
+				BRDown();
+				break;
+			}
+			default: {
+				Input(pressed);
+				break;
+			}
+		}
+	}
+
+	void ResetRotors() {
+		ROTORS = new List<int>[] { //These are listed in position 0- they might move
+			(new int[] { 6, 2, 0, 9, 1, 7, 5, 8, 4, 3 }).ToList(), //0
+			(new int[] { 7, 8, 1, 0, 6, 4, 2, 9, 3, 5 }).ToList(), //1
+			(new int[] { 9, 6, 4, 2, 5, 3, 0, 8, 1, 7 }).ToList(), //2
+			(new int[] { 5, 0, 3, 7, 1, 8, 9, 4, 6, 2 }).ToList(), //3
+			(new int[] { 3, 9, 7, 5, 2, 1, 4, 6, 0, 8 }).ToList(), //4
+			(new int[] { 8, 7, 6, 1, 0, 9, 3, 5, 2, 4 }).ToList(), //5
+			(new int[] { 1, 3, 5, 8, 7, 4, 0, 2, 9, 6 }).ToList(), //6
+			(new int[] { 2, 4, 9, 6, 8, 0, 1, 3, 7, 5 }).ToList(), //7
+			(new int[] { 4, 9, 8, 2, 3, 6, 7, 1, 5, 0 }).ToList(), //8
+			(new int[] { 7, 5, 6, 4, 9, 2, 8, 0, 3, 1 }).ToList()  //9
+		};
+	}
+
+	void Submit() {
+		locked = true; //Lock input while submitting
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Submitted '{1}' at t={2}, with k={3}.", _moduleId, input, t, k);
+		if(input.Length != 8) { //Input must be exactly 8 long to proceed to calculations (leading 0s are allowed)
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Insufficient input length. Striking...", _moduleId);
+			StartCoroutine(Strike());
+			return;
+		}
+
+		long unfactored = k; //Time check
+		List<long> factors = new List<long>(10);
+		for(byte i = 0; i < PRIMES.Length; i++) {
+			//While a factor divides, append and divide it
+			while(unfactored % PRIMES[i] == 0) {
+				factors.Add(PRIMES[i]);
+				unfactored /= PRIMES[i];
+			} //Once a factor stops dividing, move to the next factor
+		} //Once unfactored part is prime or 1, add it to list
+		if(unfactored != 1)
+			factors.Add(unfactored);
+		factors.Add(1); //Only add a single 1
+		factors.Sort(); //Logging stuff
+		long factorSum = factors.Sum();
+		Debug.LogFormat("[OmegaDestroyer #{0}]: k={1} creates the factor list {2}, which adds to {3}.", _moduleId, k, ArrayToString(factors.ToArray()), factorSum);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: You submitted when the last digit of t was {1}, when it should be {2}.", _moduleId, t % 10, factorSum % 10);
+		
+		if(t % 10 != factorSum % 10) { //Actual check happens here
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Invalid submission time. Striking...", _moduleId);
+			StartCoroutine(Strike());
+			return;
+		} //If both checks passed, start the actual calculations
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Length and submission time are valid, proceeding to calculations...", _moduleId);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Rv = ({2}*{1}^2 + {3}*{1} + {4}) mod 100,000,000 = {5}", _moduleId, t, alpha, beta, omega, Rv);
+
+		//Separate Rv into digits for ciphering
+		char[] RvChars = Rv.ToString("00000000").ToCharArray();
+		long[] RvDigits = new long[RvChars.Length];
+		//This COMPLETELY fills the array with digits
+		for(byte i = 0; i < RvDigits.Length; i++)
+			RvDigits[i] = RvChars[i] - '0';
+
+		AlphaCipher(RvDigits, alpha); //Standard Alpha Cipher
+		if(mwyth) { //Hard mode extra step 1: repeat Alpha Cipher with PAINs as key starts
+			Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH is active with PAINs {1}. Repeating Alpha Cipher...", _moduleId, ArrayToString(PAINs));
+			for(byte i = 0; i < PAINs.Length; i++)
+				AlphaCipher(RvDigits, PAINs[i]);
+		} //End of Alpha Cipher
+
+		//Fill the start of the string for Beta Cipher with beta's distinct characters
+		string betaString = new string(beta.ToString().Distinct().ToArray());
+		for(char i = '1'; i < '9'; i++) { //Add most unused characters
+			if(!betaString.Contains(i))
+				betaString += i;
+		} //Add '0' if k is under 1000, otherwise add '9'
+		betaString += k < 1000 ? '0' : '9'; //Log the grid in string form
+		Debug.LogFormat("[OmegaDestroyer #{0}]: k={1}, so the Beta Cipher grid in reading order is {2}.", _moduleId, k, betaString);
+		char[] betaChars = betaString.ToCharArray(); //Turn the string into an int[] for searching
+		int[] betaGrid = new int[betaChars.Length];
+		for(byte i = 0; i < betaChars.Length; i++)
+			betaGrid[i] = betaChars[i] - '0';
+
+		int[,] coordinates = new int[4,4]; //2D grid of coordinates
+		for(byte i = 0; i < RvDigits.Length; i++) {
+			//Find the Rv digit and put its location in the coordinate grid
+			int row = i / 2; //00, 02, 10...
+			int leftCol = (i * 2) % 4;
+			int index = Array.IndexOf(betaGrid, (int)RvDigits[i]);
+			int coordRow = index == -1 ? 0 : index / 3;
+			int coordCol = index == -1 ? 0 : index % 3;
+			coordinates[row, leftCol] = coordCol;
+			coordinates[row, leftCol + 1] = coordRow;
+		} //Log the coordinate string using an overload of ArrayToString
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Coordinate string, row by row: {1}", _moduleId, ArrayToString(coordinates));
+
+		if(mwyth) { //Hard mode extra step 2: modify coordinates using PAINs' first digits
+			for(byte row = 0; row < 4; row++) {
+				for(byte col = 0; col < 4; col++) {
+					byte offset = (byte)(PAINs[row < 2 ? (col < 2 ? 0 : 1) : (col < 2 ? 2 : 3)] / 10);
+					coordinates[row, col] = (coordinates[row, col] + offset) % 3; //Add offset then mod 3
+				} //End of column loop
+			} //End of row loop
+			Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH quadrant offsets in reading order: {1}, {2}, {3}, {4}",
+				_moduleId, PAINs[0] / 10, PAINs[1] / 10, PAINs[2] / 10, PAINs[3] / 10); //Log offsets and new coordinates
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Modified string, row by row: {1}", _moduleId, ArrayToString(coordinates));
+		} //End of if statement
+
+		//Read in column reading order and lookup new coordinates
+		for(byte i = 0; i < RvDigits.Length; i++) {
+			int col = i / 2; //00, 02, 10...
+			int topRow = (i * 2) % 4;
+			int coordCol = coordinates[topRow, col];
+			int coordRow = coordinates[topRow + 1, col];
+			int index = coordRow * 3 + coordCol;
+			RvDigits[i] = betaGrid[index];
+		} //End of Beta Cipher
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Rv's digits are {1} after the coordinate lookup.", _moduleId, ArrayToString(RvDigits));
+
+		OmegaCipher(RvDigits); //Omega Cipher is big, so it's put in an entirely separate method
+		for(byte i = 0; i < RvChars.Length; i++) //Re-catenating Rv (now Cv)
+			RvChars[i] = (char)(RvDigits[i] + '0');
+		long Cv = long.Parse(new string(RvChars));
+		Debug.LogFormat("[OmegaDestroyer #{0}]: After all three ciphers, Cv = {1}", _moduleId, Cv);
+
+		long Fv = (Cv + alpha * beta + k * t * omega) % 100000000;
+		string FvString = Fv.ToString("00000000"); //Final calculations
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Fv = ({1} + {2}*{3} + {4}*{5}*{6}) mod 100,000,000 = {7}",
+			_moduleId, Cv, alpha, beta, k, t, omega, Fv); //Final logging and the ultimate check
+		Debug.LogFormat("[OmegaDestroyer #{0}]: THE EXPECTED PASSWORD IS {1}. YOUR SUBMITTED PASSWORD WAS {2}.", _moduleId, FvString, input);
+		if(input.Equals(FvString)) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Authentication confirmed. Module solved.", _moduleId);
+			Solve();
+		} else {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Incorrect password submitted. Striking...", _moduleId);
+			StartCoroutine(Strike());
+		}
+	}
+
+	void OmegaCipher(long[] RvDigits) {
+		char[] omegaChars = omega.ToString().ToCharArray();
+		int[] omegaDigits = new int[omegaChars.Length];
+		for(byte i = 0; i < omegaDigits.Length; i++)
+			omegaDigits[i] = omegaChars[i] - '0';
+
+		long[] plugboard = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+		plugboard[omegaDigits[0]]--; //Plugboard swap
+		plugboard[omegaDigits[0] - 1]++;
+		int lowest = 0; //Lowest possible unused layout
+		// First duplicate removal
+		while(omegaDigits[2] == omegaDigits[1]) {
+			omegaDigits[2] = lowest;
+			lowest++;
+		} //Second duplicate removal
+		while(omegaDigits[3] == omegaDigits[2] || omegaDigits[3] == omegaDigits[1]) {
+			omegaDigits[3] = lowest;
+			lowest++;
+		} //Third duplicate removal
+		while(omegaDigits[4] == omegaDigits[3] || omegaDigits[4] == omegaDigits[2] || omegaDigits[4] == omegaDigits[1]) {
+			omegaDigits[4] = lowest;
+			lowest++;
+		} //All duplicates are now removed, making everything work
+
+		//Reflector and rotor choices and starting positions (reflector then rotors)
+		int[] positions = {0, omegaDigits[5], omegaDigits[6], omegaDigits[7]};
+		List<int> reflector = ROTORS[omegaDigits[1]];
+		List<int> bottom = ROTORS[omegaDigits[2]];
+		List<int> middle = ROTORS[omegaDigits[3]];
+		List<int> top = ROTORS[omegaDigits[4]];
+		RotorCycle(bottom, positions[1]);
+		RotorCycle(middle, positions[2]);
+		RotorCycle(top, positions[3]);
+
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Omega is equal to {1}, which indicates the following:", _moduleId, omega);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: {1} and {2} are swapped on the plugboard, making the top row {3}.",
+			_moduleId, omegaDigits[0], omegaDigits[0] - 1, ArrayToString(plugboard));
+		Debug.LogFormat("[OmegaDestroyer #{0}]: The reflector is layout {1}, and the rotors are layouts {2}, {3}, and {4}.",
+			_moduleId, omegaDigits[1], omegaDigits[2], omegaDigits[3], omegaDigits[4]);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: The initial positions of the rotors are {1}, {2}, and {3}.",
+			_moduleId, positions[1], positions[2], positions[3]);
+		if(mwyth) { //Hard mode extra step 3: additional rotor/reflector shifting
+			Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH has further shifted things. The reflector was shifted by {1}.", _moduleId, PAINs[0] % 10);
+			Debug.LogFormat("[OmegaDestroyer #{0}]: The rotors (bottom to top) were shifted by {1}, {2}, and {3}.", _moduleId, PAINs[1] % 10, PAINs[2] % 10, PAINs[3] % 10);
+			RotorCycle(reflector, PAINs[0] % 10);
+			RotorCycle(bottom, PAINs[1] % 10);
+			RotorCycle(middle, PAINs[2] % 10);
+			RotorCycle(top, PAINs[3] % 10);
+			for(int i = 0; i < positions.Length; i++) {
+				positions[i] = (positions[i] + (int)PAINs[i]) % 10;
+			} //Updating positions to match additional shifts
+		} //Now that the enigma is set up, use it
+
+		for(int i = 0; i < RvDigits.Length; i++) {
+			List<long> passed = new List<long>(9); //Tracker of passed digits during enigma movement
+			int current = (int)RvDigits[i];
+			passed.Add(current); //Initial digit
+			int index = Array.IndexOf(plugboard, current);
+			current = top[index]; //Down to top
+			passed.Add(current); //Within top
+			index = (current - positions[3] + 10) % 10;
+			current = middle[index]; //Down to middle
+			passed.Add(current); //Within middle
+			index = (current - positions[2] + 10) % 10;
+			current = bottom[index]; //Down to bottom
+			passed.Add(current); //Within bottom
+			index = (current - positions[1] + 10) % 10;
+
+			//From this point on, everything is upside down
+			current = (index + positions[0]) % 10; //Down to reflector
+			passed.Add(current); //Within reflector
+			index = reflector.IndexOf(current);
+			current = (index + positions[1]) % 10; //Up to bottom
+			passed.Add(current); //Within bottom
+			index = bottom.IndexOf(current);
+			current = (index + positions[2]) % 10; //Up to middle
+			passed.Add(current); //Within middle
+			index = middle.IndexOf(current);
+			current = (index + positions[3]) % 10; //Up to top
+			passed.Add(current); //Within top
+			index = top.IndexOf(current);
+
+			current = (int)plugboard[index];
+			passed.Add(current); //Up to plugboard
+			RvDigits[i] = current; //Final digit and logging of all passed digits
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Digit #{1} path including start/end: {2}", _moduleId, i + 1, ArrayToString(passed.ToArray()));
+			SmartRotorCycle(bottom, middle, top, positions, omegaDigits); //Enigma rotor turning mechanism
+		}
+	}
+
+	void SmartRotorCycle(List<int> bottom, List<int> middle, List<int> top, int[] positions, int[] omegaDigits) {
+		//Note: each rotor's change position is identical to its layout number
+		if(positions[2] == omegaDigits[3]) { //Triple rotor rotation (including "double-step")
+			RotorCycle(top);
+			positions[3] = (positions[3] + 1) % 10;
+			RotorCycle(middle);
+			positions[2] = (positions[2] + 1) % 10;
+			RotorCycle(bottom);
+			positions[1] = (positions[1] + 1) % 10;
+		} else if(positions[3] == omegaDigits[4]) { //Double rotor rotation
+			RotorCycle(top);
+			positions[3] = (positions[3] + 1) % 10;
+			RotorCycle(middle);
+			positions[2] = (positions[2] + 1) % 10;
+		} else { //Single rotor rotation
+			RotorCycle(top);
+			positions[3] = (positions[3] + 1) % 10;
+		}
+	}
+
+	void RotorCycle(List<int> rotor) {
+		RotorCycle(rotor, 1);
+	}
+
+	void RotorCycle(List<int> rotor, long amount) {
+		for(byte i = 0; i < amount; i++) {
+			int cycling = rotor[0];
+			rotor.RemoveAt(0);
+			rotor.Add(cycling);
+		}
+	}
+
+	void AlphaCipher(long[] RvDigits, long keyStart) {
+		string initialDigits = ArrayToString(RvDigits);
+		//Separate the starting key into digits for ciphering
+		char[] keyChars = keyStart.ToString().ToCharArray();
+		long[] keyDigits = new long[RvDigits.Length];
+		//This PARTIALLY fills the array with digits
+		for(byte i = 0; i < keyChars.Length; i++)
+			keyDigits[i] = keyChars[i] - '0';
+
+		//Main autokey loop (works digit by digit)
+		for(byte i = 0; i < RvDigits.Length; i++) {
+			RvDigits[i] = (RvDigits[i] + keyDigits[i]) % 10;
+			if(keyChars.Length + i < RvDigits.Length)
+				keyDigits[keyChars.Length + i] = RvDigits[i];
+		} //Extend key with calculated digit only if necessary
+
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Alpha Cipher with key {1} has changed the digits of Rv as follows:", _moduleId, keyStart);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: {1} + {2} => {3}", _moduleId, initialDigits, ArrayToString(keyDigits), ArrayToString(RvDigits));
+	}
+
+	void Solve() {
+		StopCycle();
+		solved = true;
+		muted = false; //Unmute and play solve sound
+		if(!Application.isEditor)
+			Audio.PlaySoundAtTransform("ModuleSolved", Numbers[0].transform);
+
+		ColorChanger[0].material = Lights[2];
+		ColorChanger[1].material = Lights[2];
+		Lightarray[0].color = Color.green;
+		Lightarray[1].color = Color.green;
+		for(byte i = 0; i < Buttons.Length; i++)
+			BCChanger[i].material = BColors[mwyth && i < NUMBERED_BUTTONS ? 4 : 3];
+		Module.HandlePass();
+	}
+
+	IEnumerator Strike() {
+		StopCycle();
+		Module.HandleStrike();
+		if(!Application.isEditor)
+			Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+		ResetRotors(); //Reset rotors and make lights red
+		ColorChanger[0].material = Lights[1];
+		ColorChanger[1].material = Lights[1];
+		Lightarray[0].color = Color.red;
+		Lightarray[1].color = Color.red;
+		for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+			BCChanger[i].material = BColors[1];
+		yield return new WaitForSeconds(1f);
+
+		if(mwyth) { //Hard mode strike (full reset)
+			mwythDeactivatable = true;
+			StartCoroutine(MWYTHOn(false));
+		} else { //Normal strike (no full reset)
+			Clear(); //Reset display colors and restart cycle
+			for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+				BCChanger[i].material = BColors[i == 10 && muted ? 4 : 5];
+			StartCoroutine(MainCycle());
+			locked = false;
+		} //Always reset light colors
+		ColorChanger[0].material = Lights[0];
+		ColorChanger[1].material = Lights[0];
+		Lightarray[0].color = Color.black;
+		Lightarray[1].color = Color.black;
+	}
+
+	IEnumerator StartButWithYieldReturnNewWaitforseconds() {
+		if(!Application.isEditor) //Skip waiting for lights in editor
+			yield return new WaitForSeconds(LIGHTS_DELAY);
+		FullReset(false); //SafetyCheck only started here
+		StartCoroutine(SafetyCheck());
+	}
+
+	void StopCycle() {
+		shouldStop = true;
+		StopCoroutine(MainCycle());
+	}
+
+	IEnumerator SafetyCheck() { //Emergency restarts MainCycle if it stopped for too long
+		while(true) {
+			long t_check = t;
+			int checks = 0; //3 t-steps must occur to conclude full check
+			//If the module locked input, it might have stopped the timer, so ignore this check
+			yield return new WaitForSeconds(0.1f); //Also wait between checks to avoid an infinite loop of checking
+			while(t_check == t && !locked && checks < 30 * TIME_DELAY) {
+				yield return new WaitForSeconds(0.1f);
+				checks++;
+			}
+
+			if(solved) //This is the only way this method can stop
+				yield break;
+
+			if(checks >= 30 * TIME_DELAY && !locked) { //If the module got stuck, restart it
+				Debug.LogFormat("[OmegaDestroyer #{0}]: SAFETY CHECK FOR STOPPED CYCLE TRIPPED - UNLIKELY TIMING OR BUG", _moduleId);
+				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+					BCChanger[i].material = BColors[2];
+				Numbers[2].text = "SA";
+				Numbers[3].text = "FE";
+				Numbers[4].text = "TY";
+				Numbers[5].text = "--";
+				if(!Application.isEditor) //More like "ModuleStuck"
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				yield return new WaitForSeconds(0.5f);
+				Numbers[2].text = "RE";
+				Numbers[3].text = "-C";
+				Numbers[4].text = "YC";
+				Numbers[5].text = "LE";
+				if(!Application.isEditor) //More like "ModuleStuck"
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				yield return new WaitForSeconds(0.5f);
+				if(!Application.isEditor) //More like "ModuleStuck"
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+					BCChanger[i].material = BColors[mwyth ? 0 : 5];
+				t++; //Jump to next t immediately
+				StartCoroutine(MainCycle());
+			}
+		}
+	}
+
+	IEnumerator MainCycle() {
+		justReset = true;
+		while(true) {
+			if(!justReset) { //Don't wait (or increment t) on initial update
+				yield return new WaitForSeconds(TIME_DELAY);
+				if(shouldStop) { //Stop coroutine if it dodged StopCoroutine(MainCycle()) here
+					shouldStop = false;
+					yield break;
+				}
+				t++; //Commenting out this line allows the safety check to trip repeatedly (useful for testing, but displays may glitch)
+			}
+
+			if(t >= FULL_RESET_TIME) {
+				FullReset(false);
+				yield break;
+			} //If it's time for a full reset, do so
+			ColorCountdown(); //Else, handle KYBER countdown and Rv update
+			Rv = (alpha * t * t + beta * t + omega) % 100000000;
+			if(MWYTH_NUMBERS.Contains(Rv)) { //Automatic hard mode start (logs when it happened)
+				Debug.LogFormat("[OmegaDestroyer #{0}]: Rv has become {1} at time {2}.", _moduleId, Rv, t);
+				if(mwyth) {
+					Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH is already active, so this value will be blanked out.", _moduleId);
+					Rv = 4545454545;
+				} else {
+					StartCoroutine(MWYTHOn(false));
+					yield break;
+				}
+			}
+
+			//THIS CODE INTENTIONALLY NOT DONE BY UPDATE DISPLAYS METHOD TO AVOID CONFLICTS
+			if(!split) { //Only update any displays if not split
+				Numbers[1].text = (t < 1000 ? "!" : "") + t.ToString();
+				//Only show Rv if not showing input or PAINs
+				if(input.Length == 0 && !showingPAINs) {
+					string RvString = Rv.ToString("00000000");
+					for(byte i = 0; i < swaps.Length; i++) {
+						//1. Get the (i+1)th digit pair
+						string digitPair = RvString.Substring(2*i, 2);
+						//2. Reverse it if the (n+1)th swap flag is true
+						string displayPair = swaps[i] ? new string(digitPair.Reverse().ToArray()) : digitPair;
+						//3. Set the (i+1)th main display's text to the calculated display pair
+						Numbers[NON_MAIN_NUMBERS + i].text = displayPair;
+					} //Extremely rare case: blank out displays
+					if(Rv == 4545454545) { //(If a MWYTH number appears in MWYTH)
+						for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
+							Numbers[i].text = "!!";
+					}
+				}
+			} //Module has no longer just reset
+			justReset = false;
+		}
+	}
+
+	void ColorCountdown() { //Time 0 on reset, loops to 0 every 180 t-steps
+		byte time = (byte)((t - (INITIAL_TIME % 180)) % 180);
+		if(time == 0) { //Time expired: Reset KYBER and colors
+			KYBERReset(); //This is where the KYBER is reset in a full reset
+			for(byte i = 0; i < NUMBERED_BUTTONS; i++)
+				BCChanger[i].material = BColors[3];
+			nextButton = 9;
+		} else if(time < 15 * 11) { //Change 1 to yellow every 30s (15 t-steps)
+			if(time % 15 == 0) {
+				BCChanger[nextButton].material = BColors[2];
+				nextButton--;
+				if(nextButton < 0)
+					nextButton = 4;
+			}
+		} else { //Final 30 seconds: Change 2 to red every 6s (3 t-steps)
+			if(time % 3 == 0) {
+				BCChanger[nextButton + 5].material = BColors[1];
+				BCChanger[nextButton].material = BColors[1];
+				nextButton--;
+			}
+		}
+	}
+
+	//Do not use when fully resetting
+	void Clear() {
+		input = "";
+		UpdateDisplays();
+	}
+
+	void Input(int pressed) {
+		if(input.Length >= 8) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Maximum input length exceeded. Striking...", _moduleId);
+			StartCoroutine(Strike()); //Input too big: strike and return
+			return;
+		} //Append and update
+		input += pressed;
+		UpdateDisplays();
+	}
+
+	//This function is only for immediate updates.
+	//It is separate from the main cycle timed updates.
+	void UpdateDisplays() {
+		if(!split) //Update timer if unsplit
+			Numbers[1].text = (t < 1000 ? "!" : "") + t.ToString();
+		if(input.Length > 0) { //Showing input (updates even when split)
+			string inputString = input + "-------";
+			for(byte i = 0; i < Numbers.Length - NON_MAIN_NUMBERS; i++) {
+				//1. Get the (i+1)th digit pair as a string
+				string digitPair = inputString.Substring(2 * i, 2);
+				//2. Set the (i+1)th main display's text and color
+				Numbers[NON_MAIN_NUMBERS + i].text = digitPair;
+				Numbers[NON_MAIN_NUMBERS + i].color = Color.magenta;
+			}
+		} else if(!split) { //Otherwise, only update displays if not split
+			if(showingPAINs) { //Showing PAINs (new code)
+				for(byte i = 0; i < Numbers.Length - NON_MAIN_NUMBERS; i++) {
+					//1. Get the (i+1)th PAIN as a string
+					string PAINString = PAINs[i].ToString("00");
+					//2. Set the (i+1)th main display's text and color
+					Numbers[NON_MAIN_NUMBERS + i].text = PAINString;
+					Numbers[NON_MAIN_NUMBERS + i].color = Color.cyan;
+				}
+			} else { //Showing Rv (mostly same code as main cycle)
+				string RvString = Rv.ToString("00000000");
+				for(byte i = 0; i < Numbers.Length - NON_MAIN_NUMBERS; i++) {
+					//1. Get the (i+1)th digit pair as a string
+					string digitPair = RvString.Substring(2 * i, 2);
+					//2. Reverse it if the (n+1)th swap flag is true
+					string displayPair = swaps[i] ? new string(digitPair.Reverse().ToArray()) : digitPair;
+					//3. Set the (i+1)th main display's text and color
+					Numbers[NON_MAIN_NUMBERS + i].text = displayPair;
+					Numbers[NON_MAIN_NUMBERS + i].color = mwyth ? Color.yellow : Color.black;
+				} //Extremely rare case: blank out displays
+				if(Rv == 4545454545) { //(If a MWYTH number appears in MWYTH)
+					for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
+						Numbers[i].text = "!!";
+				}
+			}
+		}
+	}
+
+	void FullReset() {
+		FullReset(true);
+	}
+
+	void FullReset(bool stop) {
+		locked = true;
+		if(stop)
+			StopCycle();
+		t = INITIAL_TIME; //Reset most values to initial
+		ResetRotors(); //Even rotors, to be safe
+		split = showingPAINs = false;
+		input = "";
+
+		Numbers[1].color = Color.black; //Reset text colors too
+		for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
+			Numbers[i].color = mwyth ? Color.yellow : Color.black;
+
+		//Randomize quadratic values
+		alpha = Rnd.Range(1, 10000);
+		string bString; //Temporary string to store beta in
+		do { //No 0s or 9s allowed in beta
+			beta = Rnd.Range(11111, 8888889);
+			bString = beta.ToString();
+		} while(bString.Contains("0") || bString.Contains("9"));
+		omega = Rnd.Range(10000000, 100000000);
+
+		Debug.LogFormat("[OmegaDestroyer #{0}]: The module has fully reset with the following values: α={1}, β={2}, ω={3}", _moduleId, alpha, beta, omega);
+		StartCoroutine(MainCycle()); //Log values, resume cycling, and unlock buttons after a full reset
+		locked = false;
+	}
+
+	void KYBERReset() {
+		int k_large = Rnd.Range(0, 100);
+		int k_small = Rnd.Range(1, 15);
+		k = 16 * k_large + k_small;
+		if(justReset) //Log KYBER immediately after a full reset (for convenience in deciphering)
+			Debug.LogFormat("[OmegaDestroyer #{0}]: The initial KYBER is {1}, which swaps according to {2}.", _moduleId, k, k_small);
+		if(!muted && !Application.isEditor) //If the module isn't muted, play a sound to indicate the KYBER reset
+			Audio.PlaySoundAtTransform("KYBERChanged", Numbers[0].transform);
+
+		//Display k_large, and set swap flags to match bits of k_small
+		Numbers[0].text = k_large.ToString("00");
+		for(byte i = 0; i < swaps.Length; i++)
+			swaps[i] = (k_small & (0x8 >> i)) > 0;
+
+		if(mwyth) { //Hard mode extra scrambling
+			for(byte i = 0; i < PAINs.Length; i++)
+				PAINs[i] = Rnd.Range(10, 100);
+			if(showingPAINs) //Update to show new PAINs
+				UpdateDisplays();
+		}
+	}
+
+	IEnumerator TLUp() {
+		long elapsed = tlHoldTime.ElapsedMilliseconds;
+		tlHoldTime.Reset();
+		if(elapsed < 3000) { //<3 seconds
+			muted = !muted; //Toggle mute and update TL color
+			BCChanger[10].material = BColors[muted ? 4 : 5];
+		} else {
+			if(elapsed < 10000) { //3-10 seconds
+				BRAction = BRActionSet.FULL_RESET;
+				BCChanger[13].material = BColors[2];
+			} else { //10+ seconds (Manual hard mode start setup)
+				BRAction = BRActionSet.HARD_MODE_START;
+				BCChanger[13].material = BColors[1];
+			}
+
+			yield return new WaitForSeconds(1f);
+			BRAction = BRActionSet.CLEAR; //Reset action after 1s
+			if(!BRBigAction) //Only reset color if BR isn't doing something big
+				BCChanger[13].material = BColors[mwyth ? 0 : 5];
+			else //If it is doing something big, reset the flag
+				BRBigAction = false;
+		}
+	}
+
+	void BRDown() {
+		BRBigAction = BRAction != BRActionSet.CLEAR;
+		switch(BRAction) {
+			case BRActionSet.HARD_MODE_START: {
+				StartCoroutine(MWYTHOn());
+				break;
+			}
+			case BRActionSet.FULL_RESET: {
+				FullReset();
+				break;
+			}
+			default: { //BRActionSet.CLEAR
+				Clear();
+				break;
+			}
+		} //Reset BR color/action IMMEDIATELY
+		if(BRAction != BRActionSet.HARD_MODE_START)
+			BCChanger[13].material = BColors[mwyth ? 0 : 5];
+		BRAction = BRActionSet.CLEAR; //(Anti-spam check)
+	}
+
+	IEnumerator Alert() {
+		if(Application.isEditor)
+			yield break; //Don't alert in editor
+		for(byte i = 0; i < 4; i++) {
+			Audio.PlaySoundAtTransform("AlertTone", Numbers[0].transform);
+			yield return new WaitForSeconds(2.25f);
+		} //Play alert tone 5 times total, only wait after first 4
+		Audio.PlaySoundAtTransform("AlertTone", Numbers[0].transform);
+	}
+
+	IEnumerator MWYTHOn() {
+		StartCoroutine(MWYTHOn(true));
+		yield break;
+	}
+
+	IEnumerator MWYTHOn(bool stop) {
+		locked = mwyth = true;
+		if(stop)
+			StopCycle();
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Oh no. (MWYTH activating...)", _moduleId);
+
+		for(byte i = 0; i < Buttons.Length; i++)
+			BCChanger[i].material = BColors[1];
+		Numbers[1].text = "OHNO";
+		for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
+			Numbers[i].text = "";
+		if(mwythDeactivatable) { //Deactivation indicator
+			Numbers[2].color = Color.green;
+			Numbers[2].text = "EZ";
+		} else { //Initial activation alert and log message
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Deactivation will unlock after a strike on this module.", _moduleId);
+			StartCoroutine(Alert());
+		} //Main countdown
+		for(float i = 9.9f; i > -0.05f; i -= 0.1f) {
+			Numbers[0].text = i.ToString("0.0");
+			yield return new WaitForSeconds(0.1f);
+		} //End of countdown
+		
+		mwythDeactivatable = false;
+		if(mwyth) { //If still active, buttons become black
+			Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH activation complete.", _moduleId);
+			for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+				BCChanger[i].material = BColors[0];
+			muted = true; //Also, the module force-mutes
+		} //No matter what, it fully resets
+		FullReset(false);
+	}
+
+	void MWYTHOff() {
+		muted = mwythDeactivatable = mwyth = false; //Reset MWYTH effects and deactivation flag
+		Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH deactivated. The module will still fully reset.", _moduleId);
+		for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+			BCChanger[i].material = BColors[5];
+		Numbers[2].text = "";
+	}
+
+	string ArrayToString(long[] arr) { //Way of printing array contents (changable)
+		string str = "";
+		bool comma = false;
+		for(byte i = 0; i < arr.Length; i++) {
+			if(comma)
+				str += ", ";
+			str += arr[i].ToString();
+			comma = true;
+		}
+		return "[" + str + "]";
+	}
+
+	string ArrayToString(int[,] arr) { //Way of printing 4*4 array contents (changable)
+		string str = "";
+		bool externalComma = false;
+		for(byte row = 0; row < 4; row++) {
+			if(externalComma)
+				str += ", ";
+			bool internalComma = false;
+
+			str += "[";
+			for(byte col = 0; col < 4; col++) {
+				if(internalComma)
+					str += ", ";
+				str += arr[row, col].ToString();
+				internalComma = true;
+			}
+			str += "]";
+
+			externalComma = true;
+		}
+		return str;
+	}
+
+	void Special(int pressed) {
+		//For the future
+	}
+}
