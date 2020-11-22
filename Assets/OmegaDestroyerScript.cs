@@ -10,7 +10,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 
 public class OmegaDestroyerScript : MonoBehaviour {
-	private const string VERSION = "1.0.0";
+	private const string VERSION = "1.1.0";
 	private const float TIME_DELAY = 2f;
 	private const float LIGHTS_DELAY = 6f;
 
@@ -30,25 +30,28 @@ public class OmegaDestroyerScript : MonoBehaviour {
 
 	private const byte NUMBERED_BUTTONS = 10; //Amount of numbered buttons, buttons after numbered are main displays
 	private const byte NON_MAIN_NUMBERS = 2; //Amount of changable numbers before main display numbers
-	private const int INITIAL_TIME = 360;
-	private const byte RESETS_BEFORE_FULL = 8; //Note: KYBER Reset = 180 t-steps, aka 360 seconds
-	private const int FULL_RESET_TIME = INITIAL_TIME + 180 * RESETS_BEFORE_FULL;
+	private const int INITIAL_TIME = 210;
+	private const byte RESETS_BEFORE_FULL = 8; //Note: KYBER Reset = 210 t-steps, aka 420 seconds
+	private const int FULL_RESET_TIME = INITIAL_TIME + 210 * RESETS_BEFORE_FULL + 10; //10 t-step grace period for TP
+	private const string DIGITS = "0123456789";
 
-	private readonly long[] MWYTH_NUMBERS = {55363537, 55363573, 55365337, 55365373, 55633537, 55633573, 55635337, 55635373};
-	private readonly byte[] PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}; //sqrt(max possible k) < 41
+	private long[] MWYTH_NUMBERS = {55363537, 55363573, 55365337, 55365373, 55633537, 55633573, 55635337, 55635373};
+	private byte[] PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}; //sqrt(max possible k) < 41
 	private List<int>[] ROTORS; //Re-initialized every strike or reset to undo possible turning
 
 	private Stopwatch tlHoldTime;
 	private sbyte nextButton; //987654321043210 repeating
 	private enum BRActionSet {CLEAR, FULL_RESET, HARD_MODE_START};
 	private BRActionSet BRAction; //What BR does when pressed (see above for options)
-	private bool locked, solved, split, muted, justReset, showingPAINs, mwythDeactivatable, mwyth, shouldStop, BRBigAction;
+	private bool locked, solved, split, muted, justReset, showingPAINs, mwythDeactivatable, mwyth, justStruck, shouldStop, BRBigAction;
 
 	//A bunch of calculation-related things
-	private long alpha, beta, omega, k, t, Rv;
+	private long alpha, beta, omega, k, grace_k, t, Rv;
 	private bool[] swaps; //TL, TR, BL, BR
 	private long[] PAINs; //P1-P4
 	private string input;
+
+	private int cycles; //Number of instances of MainCycle() believed to be running
 
 	void Awake() {
 		_moduleId = _moduleIdCounter++;
@@ -61,19 +64,18 @@ public class OmegaDestroyerScript : MonoBehaviour {
 			};
 		} //Special delegation for TL release
 		Buttons[10].OnInteractEnded += delegate {
-			if(tlHoldTime.IsRunning) {
+			if(tlHoldTime.IsRunning && !mwyth) {
 				tlHoldTime.Stop();
 				StartCoroutine(TLUp());
 			}
 		};
 	}
-
-	//Use this for initialization
+	
 	void Start() {
 		locked = true; //Lock all buttons while lights off
 		//Log start message, then set most flags and initial values/references
 		Debug.LogFormat("[OmegaDestroyer #{0}]: Version {1} of OmegaDestroyer started. Good luck!", _moduleId, VERSION);
-		solved = muted = mwythDeactivatable = mwyth = shouldStop = BRBigAction = false;
+		solved = muted = mwythDeactivatable = mwyth = justStruck = shouldStop = BRBigAction = false;
 		BRAction = BRActionSet.CLEAR; //Initially, BR just clears input
 		tlHoldTime = new Stopwatch();
 		swaps = new bool[4];
@@ -91,13 +93,14 @@ public class OmegaDestroyerScript : MonoBehaviour {
 			Audio.PlaySoundAtTransform("PressBeep", Numbers[0].transform);
 		if(mwythDeactivatable && pressed == 10 && !solved)
 			MWYTHOff();
-		if(solved && mwyth)
-			Special(pressed);
 		if(solved || locked)
 			return;
 
 		switch(pressed) {
 			case 10: { //TL
+				//Stop stopwatch if it's running
+				if(tlHoldTime.IsRunning)
+					tlHoldTime.Stop();
 				if(mwyth) { //Hard mode: toggle PAINs
 					showingPAINs = !showingPAINs;
 					UpdateDisplays();
@@ -134,16 +137,16 @@ public class OmegaDestroyerScript : MonoBehaviour {
 
 	void ResetRotors() {
 		ROTORS = new List<int>[] { //These are listed in position 0- they might move
-			(new int[] { 6, 2, 0, 9, 1, 7, 5, 8, 4, 3 }).ToList(), //0
-			(new int[] { 7, 8, 1, 0, 6, 4, 2, 9, 3, 5 }).ToList(), //1
-			(new int[] { 9, 6, 4, 2, 5, 3, 0, 8, 1, 7 }).ToList(), //2
-			(new int[] { 5, 0, 3, 7, 1, 8, 9, 4, 6, 2 }).ToList(), //3
-			(new int[] { 3, 9, 7, 5, 2, 1, 4, 6, 0, 8 }).ToList(), //4
-			(new int[] { 8, 7, 6, 1, 0, 9, 3, 5, 2, 4 }).ToList(), //5
-			(new int[] { 1, 3, 5, 8, 7, 4, 0, 2, 9, 6 }).ToList(), //6
-			(new int[] { 2, 4, 9, 6, 8, 0, 1, 3, 7, 5 }).ToList(), //7
-			(new int[] { 4, 9, 8, 2, 3, 6, 7, 1, 5, 0 }).ToList(), //8
-			(new int[] { 7, 5, 6, 4, 9, 2, 8, 0, 3, 1 }).ToList()  //9
+			(new int[] {6, 2, 0, 9, 1, 7, 5, 8, 4, 3}).ToList(), //0
+			(new int[] {7, 8, 1, 0, 6, 4, 2, 9, 3, 5}).ToList(), //1
+			(new int[] {9, 6, 4, 2, 5, 3, 0, 8, 1, 7}).ToList(), //2
+			(new int[] {5, 0, 3, 7, 1, 8, 9, 4, 6, 2}).ToList(), //3
+			(new int[] {3, 9, 7, 5, 2, 1, 4, 6, 0, 8}).ToList(), //4
+			(new int[] {8, 7, 6, 1, 0, 9, 3, 5, 2, 4}).ToList(), //5
+			(new int[] {1, 3, 5, 8, 7, 4, 0, 2, 9, 6}).ToList(), //6
+			(new int[] {2, 4, 9, 6, 8, 0, 1, 3, 7, 5}).ToList(), //7
+			(new int[] {4, 9, 8, 2, 3, 6, 7, 1, 5, 0}).ToList(), //8
+			(new int[] {7, 5, 6, 4, 9, 2, 8, 0, 3, 1}).ToList()  //9
 		};
 	}
 
@@ -409,21 +412,30 @@ public class OmegaDestroyerScript : MonoBehaviour {
 	void Solve() {
 		StopCycle();
 		solved = true;
-		muted = false; //Unmute and play solve sound
-		if(!Application.isEditor)
-			Audio.PlaySoundAtTransform("ModuleSolved", Numbers[0].transform);
-
+		muted = false;
+		input = ""; //For special string possibility
+		if(!mwythDeactivatable) {
+			if(!Application.isEditor)
+				Audio.PlaySoundAtTransform("ModuleSolved", Numbers[0].transform);
+			for(byte i = 0; i < Buttons.Length; i++)
+				BCChanger[i].material = BColors[mwyth && i < NUMBERED_BUTTONS ? 4 : 3];
+		} //Always change light colors
 		ColorChanger[0].material = Lights[2];
 		ColorChanger[1].material = Lights[2];
 		Lightarray[0].color = Color.green;
 		Lightarray[1].color = Color.green;
-		for(byte i = 0; i < Buttons.Length; i++)
-			BCChanger[i].material = BColors[mwyth && i < NUMBERED_BUTTONS ? 4 : 3];
 		Module.HandlePass();
 	}
 
 	IEnumerator Strike() {
-		StopCycle();
+		locked = justStruck = true;
+		//Bugfix for full-reset -> strike excess cycle setup
+		bool antispam = true;
+		if(t == INITIAL_TIME)
+			antispam = false;
+
+		if(antispam)
+			StopCycle();
 		Module.HandleStrike();
 		if(!Application.isEditor)
 			Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
@@ -434,7 +446,11 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		Lightarray[1].color = Color.red;
 		for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 			BCChanger[i].material = BColors[1];
-		yield return new WaitForSeconds(1f);
+		yield return new WaitForSeconds(1f); //Delay for showing strike effect
+		ColorChanger[0].material = Lights[0];
+		ColorChanger[1].material = Lights[0];
+		Lightarray[0].color = Color.black;
+		Lightarray[1].color = Color.black;
 
 		if(mwyth) { //Hard mode strike (full reset)
 			mwythDeactivatable = true;
@@ -443,13 +459,10 @@ public class OmegaDestroyerScript : MonoBehaviour {
 			Clear(); //Reset display colors and restart cycle
 			for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 				BCChanger[i].material = BColors[i == 10 && muted ? 4 : 5];
-			StartCoroutine(MainCycle());
+			if(antispam)
+				StartCycle();
 			locked = false;
-		} //Always reset light colors
-		ColorChanger[0].material = Lights[0];
-		ColorChanger[1].material = Lights[0];
-		Lightarray[0].color = Color.black;
-		Lightarray[1].color = Color.black;
+		}
 	}
 
 	IEnumerator StartButWithYieldReturnNewWaitforseconds() {
@@ -459,49 +472,109 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		StartCoroutine(SafetyCheck());
 	}
 
-	void StopCycle() {
-		shouldStop = true;
-		StopCoroutine(MainCycle());
+	void StartCycle() {
+		if(cycles != 0) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Likely spam-caused: Module attempted to start cycling, but it was already cycling.", _moduleId);
+			return;
+		}
+		cycles++;
+		StartCoroutine(MainCycle());
 	}
 
-	IEnumerator SafetyCheck() { //Emergency restarts MainCycle if it stopped for too long
+	void StopCycle() {
+		if(cycles == 0) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Likely spam-caused: Module attempted to stop cycling, but it was already stopped.", _moduleId);
+			return;
+		}
+		cycles--;
+		shouldStop = true;
+	}
+
+	IEnumerator SafetyCheck() { //Checks if MainCycle is running exactly once when it should be
 		while(true) {
 			long t_check = t;
 			int checks = 0; //3 t-steps must occur to conclude full check
 			//If the module locked input, it might have stopped the timer, so ignore this check
 			yield return new WaitForSeconds(0.1f); //Also wait between checks to avoid an infinite loop of checking
-			while(t_check == t && !locked && checks < 30 * TIME_DELAY) {
+			while(t_check == t && !locked && checks < 20 * TIME_DELAY) {
 				yield return new WaitForSeconds(0.1f);
 				checks++;
 			}
 
-			if(solved) //This is the only way this method can stop
+			if(solved) //Stop method only when module solved, such that there's no way it stops early
 				yield break;
-
-			if(checks >= 30 * TIME_DELAY && !locked) { //If the module got stuck, restart it
-				Debug.LogFormat("[OmegaDestroyer #{0}]: SAFETY CHECK FOR STOPPED CYCLE TRIPPED - UNLIKELY TIMING OR BUG", _moduleId);
+			if(locked || t < t_check) //Ignore check if inputs were locked or time went down (i.e. full reset)
+				continue;
+			if(justStruck) { //Ignore the first check after each strike to avoid excess trigger if strike bugfix activates
+				justStruck = false;
+				continue;
+			}
+			
+			if(checks <= 6 * TIME_DELAY) { //If the module went too fast, stop and restart it
+				locked = true;
+				Debug.LogFormat("[OmegaDestroyer #{0}]: LIKELY BUG: SAFETY CHECK FOR EXCESS CYCLES TRIPPED", _moduleId);
+				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+					BCChanger[i].material = BColors[2];
+				for(int i = 0; i < cycles + 1; i++) {
+					shouldStop = true; //Manually stop all known cycles, plus 1 more
+					yield return new WaitForSeconds(1.5f * TIME_DELAY);
+				} //If there are 2+ unknown cycles, 1 will be stopped at a time (stop 2, start 1)
+				Numbers[2].text = "SA";
+				Numbers[3].text = "FE";
+				Numbers[4].text = "TY";
+				Numbers[5].text = "--";
+				if(!Application.isEditor)
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				yield return new WaitForSeconds(0.5f);
+				Numbers[2].text = "ST";
+				Numbers[3].text = "OP";
+				Numbers[4].text = "PE";
+				Numbers[5].text = "R-";
+				if(!Application.isEditor)
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				yield return new WaitForSeconds(0.5f);
+				Numbers[2].text = "FI";
+				Numbers[3].text = "NI";
+				Numbers[4].text = "SH";
+				Numbers[5].text = "ED";
+				if(!Application.isEditor)
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				yield return new WaitForSeconds(0.5f);
+				if(!Application.isEditor)
+					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
+				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
+					BCChanger[i].material = BColors[mwyth ? 0 : 5];
+				cycles = 0; //Update cycle counter: it should be 0 at this point
+				t++; //Jump to next t immediately
+				locked = shouldStop = false;
+				StartCycle();
+			} else if(checks >= 20 * TIME_DELAY) { //If the module stopped, restart it
+				locked = true;
+				Debug.LogFormat("[OmegaDestroyer #{0}]: LIKELY BUG: SAFETY CHECK FOR STOPPED CYCLE TRIPPED", _moduleId);
 				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 					BCChanger[i].material = BColors[2];
 				Numbers[2].text = "SA";
 				Numbers[3].text = "FE";
 				Numbers[4].text = "TY";
 				Numbers[5].text = "--";
-				if(!Application.isEditor) //More like "ModuleStuck"
+				if(!Application.isEditor)
 					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
 				yield return new WaitForSeconds(0.5f);
 				Numbers[2].text = "RE";
-				Numbers[3].text = "-C";
-				Numbers[4].text = "YC";
-				Numbers[5].text = "LE";
-				if(!Application.isEditor) //More like "ModuleStuck"
+				Numbers[3].text = "-S";
+				Numbers[4].text = "TA";
+				Numbers[5].text = "RT";
+				if(!Application.isEditor)
 					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
 				yield return new WaitForSeconds(0.5f);
-				if(!Application.isEditor) //More like "ModuleStuck"
+				if(!Application.isEditor)
 					Audio.PlaySoundAtTransform("ModuleStruck", Numbers[0].transform);
 				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 					BCChanger[i].material = BColors[mwyth ? 0 : 5];
+				cycles = 0; //Update cycle counter: it should be 0 at this point
 				t++; //Jump to next t immediately
-				StartCoroutine(MainCycle());
+				locked = shouldStop = false;
+				StartCycle();
 			}
 		}
 	}
@@ -509,13 +582,17 @@ public class OmegaDestroyerScript : MonoBehaviour {
 	IEnumerator MainCycle() {
 		justReset = true;
 		while(true) {
-			if(!justReset) { //Don't wait (or increment t) on initial update
-				yield return new WaitForSeconds(TIME_DELAY);
-				if(shouldStop) { //Stop coroutine if it dodged StopCoroutine(MainCycle()) here
+			if(!justReset) { //No wait/increment after reset
+				yield return new WaitForSeconds(TIME_DELAY / 2); //Comment out to test safety STOPPER
+				yield return new WaitForSeconds(TIME_DELAY / 2);
+				if(shouldStop) { //Stop coroutine if it should stop (StopCoroutine not used because the above yields could dodge it)
 					shouldStop = false;
 					yield break;
 				}
-				t++; //Commenting out this line allows the safety check to trip repeatedly (useful for testing, but displays may glitch)
+
+				//continue; //Uncomment to test safety RESTART (must stay commented to test safety STOPPER)
+				if(!justReset)
+					t++;
 			}
 
 			if(t >= FULL_RESET_TIME) {
@@ -527,7 +604,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 			if(MWYTH_NUMBERS.Contains(Rv)) { //Automatic hard mode start (logs when it happened)
 				Debug.LogFormat("[OmegaDestroyer #{0}]: Rv has become {1} at time {2}.", _moduleId, Rv, t);
 				if(mwyth) {
-					Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH is already active, so this value will be blanked out.", _moduleId);
+					Debug.LogFormat("[OmegaDestroyer #{0}]: MWYTH is already active, so this value will be dashed out.", _moduleId);
 					Rv = 4545454545;
 				} else {
 					StartCoroutine(MWYTHOn(false));
@@ -540,7 +617,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 				Numbers[1].text = (t < 1000 ? "!" : "") + t.ToString();
 				//Only show Rv if not showing input or PAINs
 				if(input.Length == 0 && !showingPAINs) {
-					string RvString = Rv.ToString("00000000");
+					string RvString = MWYTH_NUMBERS.Contains(Rv) ? "--------" : Rv.ToString("00000000");
 					for(byte i = 0; i < swaps.Length; i++) {
 						//1. Get the (i+1)th digit pair
 						string digitPair = RvString.Substring(2*i, 2);
@@ -548,10 +625,6 @@ public class OmegaDestroyerScript : MonoBehaviour {
 						string displayPair = swaps[i] ? new string(digitPair.Reverse().ToArray()) : digitPair;
 						//3. Set the (i+1)th main display's text to the calculated display pair
 						Numbers[NON_MAIN_NUMBERS + i].text = displayPair;
-					} //Extremely rare case: blank out displays
-					if(Rv == 4545454545) { //(If a MWYTH number appears in MWYTH)
-						for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
-							Numbers[i].text = "!!";
 					}
 				}
 			} //Module has no longer just reset
@@ -559,21 +632,21 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		}
 	}
 
-	void ColorCountdown() { //Time 0 on reset, loops to 0 every 180 t-steps
-		byte time = (byte)((t - (INITIAL_TIME % 180)) % 180);
+	void ColorCountdown() { //Time 0 on reset, loops to 0 every 210 t-steps
+		byte time = (byte)((t - (INITIAL_TIME % 210)) % 210);
 		if(time == 0) { //Time expired: Reset KYBER and colors
 			KYBERReset(); //This is where the KYBER is reset in a full reset
 			for(byte i = 0; i < NUMBERED_BUTTONS; i++)
 				BCChanger[i].material = BColors[3];
 			nextButton = 9;
-		} else if(time < 15 * 11) { //Change 1 to yellow every 30s (15 t-steps)
-			if(time % 15 == 0) {
+		} else if(time < 18 * 11) { //Change 1 to yellow every 36s (18 t-steps)
+			if(time % 18 == 0) {
 				BCChanger[nextButton].material = BColors[2];
 				nextButton--;
 				if(nextButton < 0)
 					nextButton = 4;
 			}
-		} else { //Final 30 seconds: Change 2 to red every 6s (3 t-steps)
+		} else { //Final 24 seconds: Change 2 to red every 6s (3 t-steps)
 			if(time % 3 == 0) {
 				BCChanger[nextButton + 5].material = BColors[1];
 				BCChanger[nextButton].material = BColors[1];
@@ -604,7 +677,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		if(!split) //Update timer if unsplit
 			Numbers[1].text = (t < 1000 ? "!" : "") + t.ToString();
 		if(input.Length > 0) { //Showing input (updates even when split)
-			string inputString = input + "-------";
+			string inputString = MWYTH_NUMBERS.Contains(long.Parse(input)) ? "--------" : input + "-------";
 			for(byte i = 0; i < Numbers.Length - NON_MAIN_NUMBERS; i++) {
 				//1. Get the (i+1)th digit pair as a string
 				string digitPair = inputString.Substring(2 * i, 2);
@@ -622,7 +695,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 					Numbers[NON_MAIN_NUMBERS + i].color = Color.cyan;
 				}
 			} else { //Showing Rv (mostly same code as main cycle)
-				string RvString = Rv.ToString("00000000");
+				string RvString = MWYTH_NUMBERS.Contains(Rv) ? "--------" : Rv.ToString("00000000");
 				for(byte i = 0; i < Numbers.Length - NON_MAIN_NUMBERS; i++) {
 					//1. Get the (i+1)th digit pair as a string
 					string digitPair = RvString.Substring(2 * i, 2);
@@ -631,10 +704,6 @@ public class OmegaDestroyerScript : MonoBehaviour {
 					//3. Set the (i+1)th main display's text and color
 					Numbers[NON_MAIN_NUMBERS + i].text = displayPair;
 					Numbers[NON_MAIN_NUMBERS + i].color = mwyth ? Color.yellow : Color.black;
-				} //Extremely rare case: blank out displays
-				if(Rv == 4545454545) { //(If a MWYTH number appears in MWYTH)
-					for(byte i = NON_MAIN_NUMBERS; i < Numbers.Length; i++)
-						Numbers[i].text = "!!";
 				}
 			}
 		}
@@ -651,6 +720,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		t = INITIAL_TIME; //Reset most values to initial
 		ResetRotors(); //Even rotors, to be safe
 		split = showingPAINs = false;
+		k = 0; //For grace_k
 		input = "";
 
 		Numbers[1].color = Color.black; //Reset text colors too
@@ -667,11 +737,12 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		omega = Rnd.Range(10000000, 100000000);
 
 		Debug.LogFormat("[OmegaDestroyer #{0}]: The module has fully reset with the following values: α={1}, β={2}, ω={3}", _moduleId, alpha, beta, omega);
-		StartCoroutine(MainCycle()); //Log values, resume cycling, and unlock buttons after a full reset
+		StartCycle(); //Log values, resume cycling, and unlock buttons after a full reset
 		locked = false;
 	}
 
 	void KYBERReset() {
+		grace_k = k; //Store previous k for TP grace period
 		int k_large = Rnd.Range(0, 100);
 		int k_small = Rnd.Range(1, 15);
 		k = 16 * k_large + k_small;
@@ -688,6 +759,8 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		if(mwyth) { //Hard mode extra scrambling
 			for(byte i = 0; i < PAINs.Length; i++)
 				PAINs[i] = Rnd.Range(10, 100);
+			while(PAINs[0] == 55) //Prevent the PAINs from showing a MWYTH number
+				PAINs[0] = Rnd.Range(10, 100);
 			if(showingPAINs) //Update to show new PAINs
 				UpdateDisplays();
 		}
@@ -710,7 +783,7 @@ public class OmegaDestroyerScript : MonoBehaviour {
 
 			yield return new WaitForSeconds(1f);
 			BRAction = BRActionSet.CLEAR; //Reset action after 1s
-			if(!BRBigAction) //Only reset color if BR isn't doing something big
+			if(!BRBigAction && !locked) //Only reset color if BR isn't doing something big, and module isn't locked
 				BCChanger[13].material = BColors[mwyth ? 0 : 5];
 			else //If it is doing something big, reset the flag
 				BRBigAction = false;
@@ -828,7 +901,177 @@ public class OmegaDestroyerScript : MonoBehaviour {
 		return str;
 	}
 
-	void Special(int pressed) {
-		//For the future
+	#pragma warning disable 414
+	string TwitchHelpMessage = "Use !{0} time (Display current module time) || [press] <digits> (Input a password) || [press] <display> [at <time>] (Press a display, use !{0} displays for a list of usable display names) || hold tl for <duration> then press br (Duration must be a whole number between 3 and 11 inclusive).";
+	#pragma warning restore 414
+
+	IEnumerator ProcessTwitchCommand(string command) {
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Twitch command received: '{1}'", _moduleId, command);
+		if(tlHoldTime.IsRunning) {
+			tlHoldTime.Stop();
+			tlHoldTime.Reset();
+		} //Stop and reset TL hold time in case a command was cancelled
+		bool waited = false;
+		command = command.ToLowerInvariant().Trim();
+		if(locked) { //Don't allow commands when locking except when deactivating hard mode
+			if(mwythDeactivatable && Regex.IsMatch(command, "^(tl|mute)$")) {
+				Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press TL to deactivate hard mode", _moduleId);
+				Buttons[10].OnInteract();
+				yield return new WaitForSeconds(0.1f);
+				yield return null;
+				Buttons[10].OnInteractEnded();
+				yield break;
+			} else {
+				yield return "sendtochaterror The module has locked inputs for a time.";
+				yield break;
+			}
+		}
+		
+		if(command.Equals("displays")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: show display list", _moduleId);
+			yield return "sendtochat Names for TL: tl / mute || Names for TR: tr / submit / destroy / destructinate || Names for BL: bl / split || Names for BR: br / clear";
+			yield break;
+		} else if(command.Equals("time")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: show current time", _moduleId);
+			yield return "sendtochat Current elapsed time: " + t;
+			yield break;
+		} else if(command.StartsWith("hold tl for ") && command.EndsWith(" then press br")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: hold TL, press BR", _moduleId);
+			if(mwyth) { //TL holding is blocked in hard mode
+				yield return "sendtochaterror Cannot hold TL while MWYTH is active.";
+				yield break;
+			} //Remove everything but the duration from the command
+			command = command.Replace("hold tl for ", "").Replace(" then press br", "").Trim();
+			int duration; //Attempt to parse the duration
+			bool parsed = int.TryParse(command, out duration);
+			if(!parsed || duration < 3 || duration > 11) {
+				yield return "sendtochaterror Invalid duration.";
+				yield break;
+			} //If it's valid and in range, start holding
+			Buttons[10].OnInteract();
+			for(long i = 0; i < duration; i++) {
+				yield return new WaitForSeconds(1f);
+				yield return "trycancel";
+				if(locked) //Stop holding if inputs get locked
+					break; //(If this toggles mute status, it's perfectly fine.)
+			} //Hold for another half-second for safety, then release and check locked status
+			yield return new WaitForSeconds(0.5f);
+			Buttons[10].OnInteractEnded();
+			if(locked) {
+				yield return "sendtochaterror The module locked inputs while holding TL.";
+				yield break;
+			} //Done holding, wait a bit before pressing BR
+			yield return new WaitForSeconds(0.25f);
+			yield return null;
+			Buttons[13].OnInteract();
+			yield break;
+		}
+
+		if(command.StartsWith("press ")) { //Trimming and/or waiting
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: 'press' removed in simplification", _moduleId);
+			command = command.Replace("press ", "").Trim();
+		} //Regex: a display, followed by whitespace, then "at", then more whitespace
+		if(Regex.IsMatch(command, "^(tl|mute|tr|submit|destroy|destructinate|bl|split|br|clear)\\s+at\\s+")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: 'at <time>' processed and removed in simplification", _moduleId);
+			int index = command.IndexOf("at");
+			string end = command.Substring(index + 2).Trim();
+			command = command.Substring(0, index).Trim();
+			long press_time; //Attempt to parse the pressing time
+			bool parsed = long.TryParse(end, out press_time);
+			if(!parsed || press_time < INITIAL_TIME || press_time >= FULL_RESET_TIME) {
+				yield return "sendtochaterror Invalid pressing time.";
+				yield break;
+			} //Time must be reachable without resetting
+			if(t > press_time) {
+				yield return "sendtochaterror This time has already passed.";
+				yield break;
+			} //If it's valid, in range, and reachable, start waiting
+			while(t != press_time && !locked) {
+				yield return new WaitForSeconds(0.1f);
+				yield return "trycancel";
+			} //Check locked status
+			if(locked) {
+				yield return "sendtochaterror The module locked inputs while waiting.";
+				yield break;
+			} //Done waiting
+			waited = true;
+		}
+		
+		if(command.Equals("")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: empty command (INVALID)", _moduleId);
+			yield return "sendtochaterror Invalid command.";
+			yield break;
+		} else if(Regex.IsMatch(command, "^(tl|mute)$")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press TL", _moduleId);
+			Buttons[10].OnInteract();
+			yield return new WaitForSeconds(0.1f);
+			yield return null;
+			Buttons[10].OnInteractEnded();
+			yield break;
+		} else if(Regex.IsMatch(command, "^(tr|submit|destroy|destructinate)$")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press TR", _moduleId);
+			if(!waited) { //Ensure that the module can only submit an answer if it waited
+				yield return "sendtochaterror Submitting without a time is not a good idea.";
+				yield break;
+			} //SUBMISSION HAPPENS HERE
+			yield return null;
+			long temp = k;
+			if((t - (INITIAL_TIME % 210)) % 210 < 10 && grace_k != 0)
+				k = grace_k; //Grace period: submit with previous k
+			Buttons[11].OnInteract();
+			k = temp; //Return to normal k when done
+			yield break;
+		} else if(Regex.IsMatch(command, "^(bl|split)$")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press BL", _moduleId);
+			yield return null;
+			Buttons[12].OnInteract();
+			yield break;
+		} else if(Regex.IsMatch(command, "^(br|clear)$")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press BR", _moduleId);
+			yield return null;
+			Buttons[13].OnInteract();
+			yield break;
+		} else if(Regex.IsMatch(command, "^\\d+$")) {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: press numbers", _moduleId);
+			char[] presses = command.ToCharArray();
+			if(input.Length + presses.Length > 8) {
+				yield return "sendtochaterror Sending this much input is not a good idea.";
+				yield break;
+			} //Press a button for each character
+			for(int i = 0; i < presses.Length; i++) {
+				yield return new WaitForSeconds(0.1f);
+				Buttons[presses[i] - '0'].OnInteract();
+			}
+			yield return null;
+			yield break;
+		} else {
+			Debug.LogFormat("[OmegaDestroyer #{0}]: Interpretation: unknown command (INVALID)", _moduleId);
+			yield return "sendtochaterror Invalid command.";
+			yield break;
+		}
+	}
+
+	IEnumerator TwitchHandleForcedSolve() {
+		//yield return null;
+		muted = locked = true;
+		StopCycle();
+		Debug.LogFormat("[OmegaDestroyer #{0}]: A bypass has been detected. Disabling extra functionality...", _moduleId);
+		mwyth = false; //mwythDeactivatable used to alter solve method
+		mwythDeactivatable = solved = true;
+		if(!Application.isEditor)
+			Audio.PlaySoundAtTransform("AlertTone", Numbers[0].transform);
+		Debug.LogFormat("[OmegaDestroyer #{0}]: Extra functionality disabled. Module force-solved.", _moduleId);
+		for(byte i = 0; i < Buttons.Length; i++) //Override colors
+			BCChanger[i].material = BColors[0];
+		for(byte i = NON_MAIN_NUMBERS - 1; i < Numbers.Length; i++)
+			Numbers[i].color = Color.red;
+		Numbers[0].text = "NO";
+		Numbers[1].text = "TIME";
+		Numbers[2].text = "BY";
+		Numbers[3].text = "PA";
+		Numbers[4].text = "SS";
+		Numbers[5].text = "ED";
+		Solve();
+		yield break;
 	}
 }
