@@ -510,8 +510,8 @@ public class OmegaDestroyerScript : MonoBehaviour {
 				continue;
 			}
 			
-			if(checks <= 6 * TIME_DELAY) { //If the module went too fast, stop and restart it
-				locked = true;
+			if(checks <= 6 * TIME_DELAY || t > t_check + 1) {
+				locked = true; //If the module went too fast, stop and restart it
 				Debug.LogFormat("[OmegaDestroyer #{0}]: LIKELY BUG: SAFETY CHECK FOR EXCESS CYCLES TRIPPED", _moduleId);
 				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 					BCChanger[i].material = BColors[2];
@@ -548,8 +548,8 @@ public class OmegaDestroyerScript : MonoBehaviour {
 				t++; //Jump to next t immediately
 				locked = shouldStop = false;
 				StartCycle();
-			} else if(checks >= 20 * TIME_DELAY) { //If the module stopped, restart it
-				locked = true;
+			} else if(checks >= 20 * TIME_DELAY) {
+				locked = true; //If the module stopped, immediately restart it
 				Debug.LogFormat("[OmegaDestroyer #{0}]: LIKELY BUG: SAFETY CHECK FOR STOPPED CYCLE TRIPPED", _moduleId);
 				for(byte i = NUMBERED_BUTTONS; i < Buttons.Length; i++)
 					BCChanger[i].material = BColors[2];
