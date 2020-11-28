@@ -14,10 +14,8 @@ MonoBehaviour:
   id: omegaDestroyer
   title: OmegaDestroyer
   author: mythers45
-  description: 'oh my.
-
-
-    Manual: PENDING'
+  description: "oh my.\r\n\r\nManual: https://ktane.timwi.de/HTML/OmegaDestroyer.html\r\nPDF:
+    https://ktane.timwi.de/PDF/OmegaDestroyer.pdf"
   version: 0.1
   outputFolder: C:\Users\Daniel\Documents
   previewImage: {fileID: 2800000, guid: 45089f386ac6e444e994bdc6e4e5658a, type: 3}
