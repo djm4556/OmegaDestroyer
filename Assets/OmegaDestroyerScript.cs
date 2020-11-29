@@ -767,11 +767,14 @@ public class OmegaDestroyerScript : MonoBehaviour {
 			current = bottom[index]; //Down to bottom
 			passed.Add(current); //Within bottom
 			index = (current - positions[1] + 10) % 10;
-
-			//From this point on, everything is upside down
+			
 			current = (index + positions[0]) % 10; //Down to reflector
 			passed.Add(current); //Within reflector
-			index = reflector.IndexOf(current);
+			index = (current - positions[0] + 10) % 10;
+			current = reflector[index]; //Up to reflector
+			passed.Add(current); //Within reflector
+			index = (current - positions[0] + 10) % 10;
+
 			current = (index + positions[1]) % 10; //Up to bottom
 			passed.Add(current); //Within bottom
 			index = bottom.IndexOf(current);
